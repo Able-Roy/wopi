@@ -15,15 +15,17 @@ function App() {
 
   const checkServerStatus = async () => {
     try {
-      // Use relative URL - Vite proxy will handle this
       const response = await fetch('/api/health');
       if (response.ok) {
+        const data = await response.json();
         setServerStatus('online');
+        console.log('✅ Server health:', data);
       } else {
         setServerStatus('error');
       }
     } catch (err) {
       setServerStatus('error');
+      console.error('❌ Server health check failed:', err);
     }
   };
 
@@ -32,53 +34,61 @@ function App() {
       setLoading(true);
       setError('');
       
-      console.log('🔄 Loading document from server...');
+      console.log('🔄 Loading document for editing...');
       
-      // Use relative URL - Vite proxy will handle this
       const response = await fetch('/api/generate-wopi-url');
       
       if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`Server returned ${response.status}: ${errorText}`);
+        throw new Error(`Server returned ${response.status}`);
       }
       
-      const { wopiSrc, accessToken, fileId } = await response.json();
+      const wopiData = await response.json();
       
-      console.log('✅ Received WOPI data:', { wopiSrc, fileId });
+      console.log('✅ Received WOPI data:', wopiData);
       
-      // Construct the Word Online editor URL
-      const wordOnlineUrl = new URL('https://word-edit.officeapps.live.com/we/wordeditorframe.aspx');
+      // Method 1: Direct edit URL (recommended)
+      // const editUrl = `https://word-edit.officeapps.live.com/we/wordeditorframe.aspx?WOPISrc=${encodeURIComponent(wopiData.wopiSrc)}&access_token=${wopiData.accessToken}`;
+      // New: Add &action=edit for explicit instruction
+      const editUrl = `https://word-edit.officeapps.live.com/we/wordeditorframe.aspx?WOPISrc=${encodeURIComponent(wopiData.wopiSrc)}&access_token=${wopiData.accessToken}&action=edit`;
       
-      // Add WOPI parameters
-      wordOnlineUrl.searchParams.append('WOPISrc', wopiSrc);
-      wordOnlineUrl.searchParams.append('access_token', accessToken);
-      wordOnlineUrl.searchParams.append('ui', 'en-US');
-      wordOnlineUrl.searchParams.append('rs', 'en-US');
-      wordOnlineUrl.searchParams.append('wdorigin', '1');
-      wordOnlineUrl.searchParams.append('hid', 'ngrok-' + Date.now());
+      console.log('🔗 Edit URL:', editUrl);
+      setIframeUrl(editUrl);
       
-      const finalUrl = wordOnlineUrl.toString();
-      console.log('🔗 Final Word Online URL:', finalUrl);
-      
-      setIframeUrl(finalUrl);
-      
-      // Also get file info to display (this will go through Vite proxy)
-      try {
-        const fileInfoResponse = await fetch(`/wopi/files/${fileId}?access_token=${accessToken}`);
-        if (fileInfoResponse.ok) {
-          const fileInfoData = await fileInfoResponse.json();
-          setFileInfo(fileInfoData);
-          console.log('📄 File info loaded:', fileInfoData);
-        }
-      } catch (infoError) {
-        console.warn('Could not load file info:', infoError);
-      }
+      // Verify file permissions
+      await verifyFilePermissions(wopiData);
       
     } catch (err) {
       console.error('❌ Error loading document:', err);
-      setError(`Failed to load document: ${err.message}. Make sure the backend server is running on port 8080.`);
+      setError(`Failed to load document: ${err.message}`);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const verifyFilePermissions = async (wopiData) => {
+    try {
+      const fileInfoResponse = await fetch(`/wopi/files/${wopiData.fileId}?access_token=${wopiData.accessToken}`);
+      if (fileInfoResponse.ok) {
+        const fileInfoData = await fileInfoResponse.json();
+        setFileInfo(fileInfoData);
+        
+        console.log('📄 File Info Response:', fileInfoData);
+        console.log('🔑 Key Permissions:', {
+          UserCanWrite: fileInfoData.UserCanWrite,
+          ReadOnly: fileInfoData.ReadOnly,
+          SupportsUpdate: fileInfoData.SupportsUpdate,
+          SupportsLocks: fileInfoData.SupportsLocks,
+          SupportsCobalt: fileInfoData.SupportsCobalt
+        });
+        
+        if (!fileInfoData.UserCanWrite || fileInfoData.ReadOnly) {
+          console.error('❌ FILE OPENING IN READ-ONLY MODE DUE TO PERMISSIONS');
+        } else {
+          console.log('✅ FILE SHOULD OPEN IN EDIT MODE');
+        }
+      }
+    } catch (infoError) {
+      console.warn('Could not load file info:', infoError);
     }
   };
 
@@ -88,30 +98,35 @@ function App() {
     loadDocument();
   };
 
-  const testServerConnection = async () => {
-    try {
-      setLoading(true);
-      const response = await fetch('/api/health');
-      if (response.ok) {
-        const health = await response.json();
-        alert(`✅ Server is healthy!\nFiles: ${health.files.join(', ')}\nTime: ${health.serverTime}`);
-        setServerStatus('online');
-      } else {
-        throw new Error(`Server health check failed: ${response.status}`);
+  const tryDifferentUrls = () => {
+    const methods = [
+      {
+        name: 'Method 1: Direct Edit',
+        url: `https://word-edit.officeapps.live.com/we/wordeditorframe.aspx?WOPISrc=${encodeURIComponent(fileInfo.HostEditUrl)}&access_token=${fileInfo.access_token}`
+      },
+      {
+        name: 'Method 2: With Action',
+        url: `https://word-edit.officeapps.live.com/we/wordeditorframe.aspx?WOPISrc=${encodeURIComponent(fileInfo.HostEditUrl)}&access_token=${fileInfo.access_token}&action=edit`
+      },
+      {
+        name: 'Method 3: Office Online',
+        url: `https://office.live.com/we/wordeditorframe.aspx?WOPISrc=${encodeURIComponent(fileInfo.HostEditUrl)}&access_token=${fileInfo.access_token}`
       }
-    } catch (err) {
-      alert(`❌ Server connection failed: ${err.message}`);
-      setServerStatus('error');
-    } finally {
-      setLoading(false);
-    }
+    ];
+    
+    methods.forEach((method, index) => {
+      console.log(`${index + 1}. ${method.name}: ${method.url}`);
+    });
+    
+    // Try the first method
+    setIframeUrl(methods[0].url);
   };
 
   return (
     <div className="App">
       <header className="App-header">
-        <h1>WOPI Document Editor Demo</h1>
-        <p>Edit your Word document directly in the browser using Microsoft Word Online</p>
+        <h1>WOPI Document Editor - EDIT MODE</h1>
+        <p>Forcing edit mode with complete WOPI implementation</p>
         
         <div className="server-status">
           <span className={`status-indicator ${serverStatus}`}>
@@ -121,9 +136,21 @@ function App() {
         
         {fileInfo && (
           <div className="file-info">
-            <span><strong>File:</strong> {fileInfo.BaseFileName}</span>
-            <span><strong>Size:</strong> {Math.round(fileInfo.Size / 1024)} KB</span>
-            <span><strong>Editable:</strong> {fileInfo.UserCanWrite ? '✅ Yes' : '❌ No'}</span>
+            <h3>File Permissions:</h3>
+            <div className="permissions-grid">
+              <span className={fileInfo.UserCanWrite ? 'success' : 'error'}>
+                UserCanWrite: {fileInfo.UserCanWrite ? '✅ true' : '❌ false'}
+              </span>
+              <span className={!fileInfo.ReadOnly ? 'success' : 'error'}>
+                ReadOnly: {fileInfo.ReadOnly ? '❌ true' : '✅ false'}
+              </span>
+              <span className={fileInfo.SupportsUpdate ? 'success' : 'error'}>
+                SupportsUpdate: {fileInfo.SupportsUpdate ? '✅ true' : '❌ false'}
+              </span>
+              <span className={fileInfo.SupportsLocks ? 'success' : 'error'}>
+                SupportsLocks: {fileInfo.SupportsLocks ? '✅ true' : '❌ false'}
+              </span>
+            </div>
           </div>
         )}
         
@@ -131,8 +158,8 @@ function App() {
           <button onClick={handleReload} disabled={loading}>
             {loading ? '🔄 Loading...' : '📄 Reload Document'}
           </button>
-          <button onClick={testServerConnection} disabled={loading}>
-            🔧 Test Server
+          <button onClick={tryDifferentUrls} disabled={loading || !fileInfo}>
+            Try Different URL
           </button>
         </div>
       </header>
@@ -140,27 +167,17 @@ function App() {
       <main className="App-main">
         {error && (
           <div className="error">
-            <h3>❌ Error Loading Document</h3>
+            <h3>❌ Error</h3>
             <p>{error}</p>
-            <div className="error-actions">
-              <button onClick={handleReload}>🔄 Try Again</button>
-              <button onClick={testServerConnection}>🔧 Test Connection</button>
-            </div>
-            <div className="debug-info">
-              <p><strong>Troubleshooting:</strong></p>
-              <p>1. Make sure backend is running: <code>node server.js</code></p>
-              <p>2. Backend should be on http://localhost:8080</p>
-              <p>3. Check that sample.docx exists in server/files/</p>
-              <p>4. Restart both frontend and backend if needed</p>
-            </div>
+            <button onClick={handleReload}>🔄 Try Again</button>
           </div>
         )}
         
         {loading ? (
           <div className="loading">
             <div className="spinner"></div>
-            <p>Loading document editor...</p>
-            <p className="loading-sub">Connecting to Microsoft Word Online</p>
+            <p>Loading Word Online Editor...</p>
+            <p className="loading-sub">Edit mode forced in CheckFileInfo</p>
           </div>
         ) : iframeUrl ? (
           <div className="editor-container">
@@ -170,8 +187,11 @@ function App() {
               title="Word Online Editor"
               className="word-iframe"
               allow="autoplay; fullscreen; clipboard-read; clipboard-write"
-              sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
-              onLoad={() => console.log('✅ Iframe loaded successfully')}
+              sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-top-navigation"
+              onLoad={() => {
+                console.log('✅ Editor iframe loaded');
+                console.log('📝 Check browser console for Office Online messages');
+              }}
               onError={(e) => console.error('❌ Iframe error:', e)}
             />
           </div>
@@ -179,13 +199,16 @@ function App() {
       </main>
       
       <footer className="App-footer">
-        <p>
-          Demo Application - WOPI Protocol Integration
-          <br />
-          Using Vite Proxy to avoid CORS issues
-          <br />
-          Changes are automatically saved back to the server when you click Save in Word Online
-        </p>
+        <div className="troubleshooting">
+          <h4>🔧 Troubleshooting Steps:</h4>
+          <ol>
+            <li>Check browser console for detailed logs</li>
+            <li>Clear browser cache completely</li>
+            <li>Verify file permissions above show ✅ true for edit mode</li>
+            <li>Try "Try Different URL" button</li>
+            <li>Check server logs for WOPI requests</li>
+          </ol>
+        </div>
       </footer>
     </div>
   );
