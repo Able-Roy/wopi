@@ -1,7 +1,8 @@
+// client/src/App.jsx — minimal fix (token is now URL-encoded on server, no other changes required)
 import React, { useState, useEffect } from 'react';
 import './App.css';
 
-function App() {
+export default function App() {
   const [iframeUrl, setIframeUrl] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -10,80 +11,37 @@ function App() {
     try {
       setLoading(true);
       setError('');
-      
-      console.log('🔄 Loading document...');
-      
-      const response = await fetch('/api/generate-wopi-url');
-      
-      if (!response.ok) {
-        throw new Error('Failed to generate WOPI URL');
-      }
-      
-      const wopiData = await response.json();
-      console.log('✅ WOPI data received');
-      
-      // Use the basic edit URL (Method 4)
-      const finalUrl = wopiData.editUrl;
-      console.log('🔗 Using basic edit URL:', finalUrl);
-      
-      setIframeUrl(finalUrl);
-      
-    } catch (err) {
-      console.error('❌ Error:', err);
-      setError(`Failed to load document: ${err.message}`);
+      const resp = await fetch('https://6e51ccd22f2a.ngrok-free.app/api/generate-wopi-url');
+      if (!resp.ok) throw new Error('Failed to generate WOPI URL');
+      const { editUrl } = await resp.json();
+      setIframeUrl(editUrl);
+    } catch (e) {
+      setError(e.message || 'Failed to load document');
     } finally {
       setLoading(false);
     }
   };
 
-  const handleReload = () => {
-    setIframeUrl(null);
-    loadDocument();
-  };
-
-  // Load document on component mount
-  useEffect(() => {
-    loadDocument();
-  }, []);
+  useEffect(() => { loadDocument(); }, []);
 
   return (
     <div className="App">
-      {/* Minimal Header - Only shows when not in iframe view */}
       {!iframeUrl && (
         <header className="App-header">
           <h1>Word Online Editor</h1>
-          <p>Integrated with WOPI Host</p>
-          
-          <div className="controls">
-            <button onClick={loadDocument} disabled={loading}>
-              {loading ? '🔄 Loading Editor...' : '📝 Open Word Editor'}
-            </button>
-          </div>
-
-          {error && (
-            <div className="error">
-              <h3>Error</h3>
-              <p>{error}</p>
-              <button onClick={loadDocument}>Try Again</button>
-            </div>
-          )}
+          <button onClick={loadDocument} disabled={loading}>
+            {loading ? 'Loading…' : 'Open Word Editor'}
+          </button>
+          {error && <p className="error">{error}</p>}
         </header>
       )}
 
-      {/* Full-screen iframe when loaded */}
       {iframeUrl && (
         <div className="fullscreen-container">
-          {/* Minimal toolbar that auto-hides */}
           <div className="toolbar">
-            <button onClick={handleReload} title="Reload">
-              🔄
-            </button>
-            <button onClick={() => setIframeUrl(null)} title="Close">
-              ❌
-            </button>
-            <span>Word Online Editor - Edit Mode</span>
+            <button onClick={() => setIframeUrl(null)}>Close</button>
+            <button onClick={loadDocument}>Reload</button>
           </div>
-          
           <iframe
             key={iframeUrl}
             src={iframeUrl}
@@ -95,15 +53,12 @@ function App() {
         </div>
       )}
 
-      {/* Loading screen */}
       {loading && (
         <div className="loading-screen">
-          <div className="loading-spinner"></div>
-          <p>Loading Word Online Editor...</p>
+          <div className="loading-spinner" />
+          <p>Loading Word Online Editor…</p>
         </div>
       )}
     </div>
   );
 }
-
-export default App;

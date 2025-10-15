@@ -1,3 +1,4 @@
+// server.js (FIXED LOCK COMPARISON)
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
@@ -5,26 +6,40 @@ const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 8080;
+const PUBLIC_BASE = process.env.PUBLIC_BASE || 'https://6e51ccd22f2a.ngrok-free.app';
+const FILES_DIR = path.join(__dirname, 'files');
+const SECRET = process.env.WOPI_SECRET || 'demo-secret';
 
-// CORS setup
+// Enable detailed logging
+const DEBUG = true;
+
+// --- CORS ---
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, OPTIONS, LOCK, UNLOCK');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, X-WOPI-Override, X-WOPI-Lock, X-WOPI-OldLock, X-WOPI-MachineName, X-WOPI-SessionId, X-WOPI-ItemVersion');
-  
-  if (req.method === 'OPTIONS') {
-    return res.status(200).end();
-  }
-  
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, PUT');
+  res.header('Access-Control-Allow-Headers', [
+    'Content-Type',
+    'Authorization',
+    'X-Requested-With',
+    'X-WOPI-Override',
+    'X-WOPI-Lock',
+    'X-WOPI-OldLock',
+    'X-WOPI-MachineName',
+    'X-WOPI-SessionId',
+    'X-WOPI-ItemVersion',
+    'Prefer'
+  ].join(', '));
+  if (req.method === 'OPTIONS') return res.status(200).end();
   next();
 });
 
-// Body parsing
+// --- Raw body for binary saves ---
 app.use((req, res, next) => {
-  if (req.headers['content-type'] === 'application/octet-stream' || 
-      req.headers['x-wopi-override']) {
+  const isBinary = req.headers['content-type'] === 'application/octet-stream';
+  const hasOverride = !!req.headers['x-wopi-override'];
+  if (isBinary || hasOverride) {
     const chunks = [];
-    req.on('data', chunk => chunks.push(chunk));
+    req.on('data', c => chunks.push(c));
     req.on('end', () => {
       req.rawBody = Buffer.concat(chunks);
       next();
@@ -34,408 +49,411 @@ app.use((req, res, next) => {
   }
 });
 
-const files = new Map();
-const locks = new Map();
+// --- In-memory indices + lock table ---
+const locks = new Map();        // fileId -> lockString (store as string)
+const versions = new Map();     // fileId -> version string
 
-// Initialize sample file
-const initializeSampleFile = () => {
-  const filePath = path.join(__dirname, 'files', 'sample.docx');
-  if (fs.existsSync(filePath)) {
-    const fileBuffer = fs.readFileSync(filePath);
-    const stats = fs.statSync(filePath);
-    const sha256 = crypto.createHash('sha256').update(fileBuffer).digest('base64');
-    
-    files.set('sample.docx', {
-      name: 'sample.docx',
-      size: stats.size,
-      lastModified: stats.mtime.toISOString(),
-      version: stats.mtime.getTime().toString(),
-      sha256: sha256,
-      contents: fileBuffer
-    });
-    console.log(`✅ Sample file loaded: ${stats.size} bytes`);
-  } else {
-    console.log('⚠️  Creating minimal DOCX file...');
-    const minimalDocx = createMinimalDocx();
-    files.set('sample.docx', {
-      name: 'sample.docx',
-      size: minimalDocx.length,
-      lastModified: new Date().toISOString(),
-      version: Date.now().toString(),
-      sha256: crypto.createHash('sha256').update(minimalDocx).digest('base64'),
-      contents: minimalDocx
-    });
-  }
+// --- Helpers ---
+const ensureFilesDir = () => { 
+  if (!fs.existsSync(FILES_DIR)) fs.mkdirSync(FILES_DIR, { recursive: true }); 
+};
+ensureFilesDir();
+
+const filePathOf = (fileId) => path.join(FILES_DIR, fileId);
+
+const readFileOrNull = (fileId) => {
+  const p = filePathOf(fileId);
+  if (!fs.existsSync(p)) return null;
+  return fs.readFileSync(p);
 };
 
-function createMinimalDocx() {
-  const base64Docx = 'UEsDBBQAAAAIAJySrVHHW+cgBAAAAAQAAAAIAAAAbWltZXR5cGVhcHBsaWNhdGlvbi92bmQub3BlbnhtbGZvcm1hdHMtb2ZmaWNlZG9jdW1lbnQud29yZHByb2Nlc3NpbmdtbC5kb2N1bWVudFBLBQYAAAAAAQABAD4AAAA0AAAAAAA=';
-  return Buffer.from(base64Docx, 'base64');
-}
-
-initializeSampleFile();
-
-// Generate access token - UPDATED to work with any file
-const generateAccessToken = (fileId) => {
-  const tokenData = {
-    fileId: fileId,
-    timestamp: Date.now(),
-    userId: 'test-user'
-  };
-  return Buffer.from(JSON.stringify(tokenData)).toString('base64');
+const writeFile = (fileId, buf) => {
+  ensureFilesDir();
+  fs.writeFileSync(filePathOf(fileId), buf);
+  const v = Date.now().toString();
+  versions.set(fileId, v);
+  if (DEBUG) console.log(`📁 [WRITE] ${fileId} - ${buf.length} bytes - version: ${v}`);
+  return v;
 };
 
-// Validate access token - UPDATED to work with any file
-const validateAccessToken = (token, fileId) => {
+const computeSha256 = (buf) => crypto.createHash('sha256').update(buf).digest('base64');
+
+const generateToken = (fileId, userId = 'test-user') => {
+  const payload = `${fileId}:${userId}`;
+  return crypto.createHmac('sha256', SECRET).update(payload).digest('base64url');
+};
+
+const validateToken = (token, fileId, userId = 'test-user') => {
   try {
-    const decoded = JSON.parse(Buffer.from(token, 'base64').toString());
-    // Check if file exists in our storage
-    return files.has(decoded.fileId) && decoded.fileId === fileId;
-  } catch (error) {
+    const expected = generateToken(fileId, userId);
+    return token === expected;
+  } catch {
     return false;
   }
 };
 
-// CheckFileInfo - UPDATED to handle any file
+const ok = (res, headers = {}) => {
+  Object.entries(headers).forEach(([k, v]) => { if (v !== undefined) res.setHeader(k, v); });
+  return res.status(200).send();
+};
+
+const conflict = (res, currentLock, reason) => {
+  res.setHeader('X-WOPI-Lock', currentLock || '');
+  if (reason) res.setHeader('X-WOPI-LockFailureReason', reason);
+  return res.status(409).send();
+};
+
+const getLockHeader = (req) => (req.headers['x-wopi-lock'] || '').toString();
+const getOldLockHeader = (req) => (req.headers['x-wopi-oldlock'] || '').toString();
+
+// FIXED: Better lock parsing and comparison
+const parseLock = (lockStr) => {
+  if (!lockStr || lockStr === '') return null;
+  try {
+    return JSON.parse(lockStr);
+  } catch {
+    return lockStr; // return as string if not JSON
+  }
+};
+
+// FIXED: Much simpler and more reliable lock comparison
+const locksMatch = (lock1, lock2) => {
+  if (lock1 === lock2) return true; // Quick string match
+  if (!lock1 || !lock2) return false;
+  
+  const parsed1 = parseLock(lock1);
+  const parsed2 = parseLock(lock2);
+  
+  // If both parsed successfully as objects, compare S and F properties
+  if (typeof parsed1 === 'object' && typeof parsed2 === 'object') {
+    return parsed1.S === parsed2.S && parsed1.F === parsed2.F;
+  }
+  
+  // Fallback to string comparison
+  return String(lock1) === String(lock2);
+};
+
+// Log all WOPI requests
+app.use('/wopi/files/:fileId', (req, res, next) => {
+  if (DEBUG) {
+    console.log('\n=== WOPI REQUEST ===');
+    console.log(`📨 ${req.method} ${req.path}`);
+    console.log(`🔑 File: ${req.params.fileId}`);
+    console.log(`🔧 Override: ${req.headers['x-wopi-override'] || 'NONE'}`);
+    console.log(`🔒 Lock: ${req.headers['x-wopi-lock'] || 'NONE'}`);
+    console.log(`🔄 OldLock: ${req.headers['x-wopi-oldlock'] || 'NONE'}`);
+    console.log(`📦 Content-Type: ${req.headers['content-type']}`);
+    console.log(`📏 Content-Length: ${req.headers['content-length']}`);
+  }
+  next();
+});
+
+// --- Bootstrap sample.docx if missing ---
+(() => {
+  const id = 'sample.docx';
+  const p = filePathOf(id);
+  if (!fs.existsSync(p)) {
+    const minimal = Buffer.from('UEsDBBQAAAAIAJySrVHHW+cgBAAAAAQAAAAIAAAAbWltZXR5cGVhcHBsaWNhdGlvbi92bmQub3BlbnhtbGZvcm1hdHMtb2ZmaWNlZG9jdW1lbnQud29yZHByb2Nlc3NpbmdtbC5kb2N1bWVudFBLBQYAAAAAAQABAD4AAAA0AAAAAAA=', 'base64');
+    writeFile(id, minimal);
+  } else {
+    versions.set(id, fs.statSync(p).mtimeMs.toString());
+  }
+})();
+
+// ===================== WOPI ROUTES =====================
+
+// CheckFileInfo
 app.get('/wopi/files/:fileId', (req, res) => {
   const { fileId } = req.params;
-  const accessToken = req.query.access_token;
+  const token = req.query.access_token;
   
-  console.log('📋 CheckFileInfo for:', fileId);
+  if (DEBUG) console.log(`🔍 [CheckFileInfo] ${fileId}`);
   
-  if (!accessToken || !validateAccessToken(accessToken, fileId)) {
-    console.log('❌ Invalid access token for file:', fileId);
-    return res.status(401).json({ error: 'Invalid token' });
-  }
+  if (!validateToken(token, fileId)) return res.status(401).json({ error: 'Invalid token' });
 
-  const file = files.get(fileId);
-  if (!file) {
-    console.log('❌ File not found:', fileId);
-    return res.status(404).json({ error: 'File not found' });
-  }
+  const buf = readFileOrNull(fileId);
+  if (!buf) return res.status(404).json({ error: 'File not found' });
 
-  const fileInfo = {
-    // Required properties
-    BaseFileName: file.name,
-    Size: file.size,
+  const stat = fs.statSync(filePathOf(fileId));
+  const currentLock = locks.get(fileId);
+  
+  const info = {
+    BaseFileName: fileId,
     OwnerId: 'test-owner',
+    Size: buf.length,
     UserId: 'test-user',
-    Version: file.version,
-    
-    // Edit permissions
+    Version: versions.get(fileId) || stat.mtimeMs.toString(),
     UserCanWrite: true,
     ReadOnly: false,
-    UserCanNotWriteRelative: false,
-    
-    // User information
-    UserFriendlyName: 'Test User',
-    
-    // File properties
-    SHA256: file.sha256,
-    LastModifiedTime: file.lastModified,
-    
-    // Supported features
     SupportsUpdate: true,
     SupportsLocks: true,
     SupportsGetLock: true,
-    SupportsCobalt: true,
-    SupportsPutRelativeFile: true,
-    SupportsRename: true,
-    SupportsDeleteFile: true,
-    
-    // ACTION URLs - Critical for edit mode
-    HostEditUrl: `https://c67feb255965.ngrok-free.app/wopi/files/${fileId}`,
-    HostViewUrl: `https://c67feb255965.ngrok-free.app/wopi/files/${fileId}`,
-    
-    // Additional properties
-    AllowExternalMarketplace: false,
-    DisablePrint: false,
-    DisableTranslation: false,
-    LicenseCheckForEditIsEnabled: false,
-    UserCanAttend: true,
-    UserCanPresent: true,
-    WebEditingDisabled: false
+    SupportsRename: false,
+    SupportsDeleteFile: false,
+    SupportsCobalt: false,
+    SupportsPutRelativeFile: false,
+    // CRITICAL FOR AUTO-SAVE:
+    SupportsExtendedLockLength: true,
+    SupportsEcosystem: false,
+    SupportsGetLock: true,
+    SupportsFolders: false,
+    LastModifiedTime: new Date(stat.mtime).toISOString(),
+    SHA256: computeSha256(buf),
+    UserFriendlyName: 'Test User',
+    HostEditUrl: `${PUBLIC_BASE}/wopi/files/${encodeURIComponent(fileId)}`,
+    HostViewUrl: `${PUBLIC_BASE}/wopi/files/${encodeURIComponent(fileId)}`,
+    UserCanNotWriteRelative: true,
+    BreadcrumbBrandName: 'WOPI Test',
+    BreadcrumbBrandUrl: PUBLIC_BASE,
+    BreadcrumbFolderName: 'files',
+    BreadcrumbDocName: fileId
   };
 
-  console.log('✅ CheckFileInfo - EDIT MODE ENABLED for:', fileId);
-  res.json(fileInfo);
+  if (DEBUG) console.log(`✅ [CheckFileInfo Response]`, { 
+    size: info.Size, 
+    version: info.Version,
+    locked: !!currentLock 
+  });
+
+  res.json(info);
 });
 
-// GetFile - UPDATED to handle any file
+// GetFile (download content)
 app.get('/wopi/files/:fileId/contents', (req, res) => {
   const { fileId } = req.params;
-  const accessToken = req.query.access_token;
+  const token = req.query.access_token;
   
-  console.log('📥 GetFile for:', fileId);
+  if (DEBUG) console.log(`📥 [GetFile] ${fileId}`);
   
-  if (!accessToken || !validateAccessToken(accessToken, fileId)) {
-    return res.status(401).json({ error: 'Invalid token' });
-  }
+  if (!validateToken(token, fileId)) return res.status(401).json({ error: 'Invalid token' });
 
-  const file = files.get(fileId);
-  if (!file) {
-    return res.status(404).json({ error: 'File not found' });
-  }
+  const buf = readFileOrNull(fileId);
+  if (!buf) return res.status(404).json({ error: 'File not found' });
 
   res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
-  res.send(file.contents);
+  res.setHeader('Content-Length', buf.length);
+  res.send(buf);
+  
+  if (DEBUG) console.log(`✅ [GetFile Sent] ${buf.length} bytes`);
 });
 
-// PutFile - UPDATED to handle any file
+// PutFile (save) - FIXED LOCK HANDLING
 app.post('/wopi/files/:fileId/contents', (req, res) => {
   const { fileId } = req.params;
-  const accessToken = req.query.access_token;
+  const token = req.query.access_token;
   
-  console.log('💾 PutFile for:', fileId, 'Size:', req.rawBody?.length || 'unknown');
+  if (DEBUG) console.log(`💾 [PutFile] ${fileId} - Starting save operation`);
   
-  if (!accessToken || !validateAccessToken(accessToken, fileId)) {
-    console.log('❌ Invalid access token for PutFile:', fileId);
-    return res.status(401).json({ error: 'Invalid token' });
-  }
+  if (!validateToken(token, fileId)) return res.status(401).json({ error: 'Invalid token' });
 
-  try {
-    // Check if we have content
-    if (!req.rawBody || req.rawBody.length === 0) {
-      console.log('❌ Empty content in PutFile request for:', fileId);
-      return res.status(400).json({ error: 'No file content provided' });
+  const incomingLock = getLockHeader(req);
+  const currentLock = locks.get(fileId) || null;
+  const oldLock = getOldLockHeader(req);
+
+  if (DEBUG) console.log(`🔒 [PutFile Locks] current: ${currentLock}, incoming: ${incomingLock}, old: ${oldLock}`);
+
+  // FIXED: Use intelligent lock comparison
+  if (currentLock) {
+    const incomingMatchesCurrent = locksMatch(incomingLock, currentLock);
+    const oldLockMatchesCurrent = locksMatch(oldLock, currentLock);
+    
+    if (DEBUG) console.log(`🔍 [PutFile Lock Check] incomingMatch: ${incomingMatchesCurrent}, oldLockMatch: ${oldLockMatchesCurrent}`);
+    
+    if (!incomingMatchesCurrent && !oldLockMatchesCurrent) {
+      if (DEBUG) console.log(`❌ [PutFile Conflict] Lock mismatch - returning 409`);
+      return conflict(res, currentLock, 'File is locked by another session');
     }
-
-    const sha256 = crypto.createHash('sha256').update(req.rawBody).digest('base64');
-    
-    // Create or update the file
-    const existingFile = files.get(fileId);
-    const updatedFile = {
-      name: fileId,
-      size: req.rawBody.length,
-      lastModified: new Date().toISOString(),
-      version: Date.now().toString(),
-      sha256: sha256,
-      contents: req.rawBody
-    };
-    
-    files.set(fileId, updatedFile);
-
-    console.log(`✅ File saved: ${fileId} - ${req.rawBody.length} bytes`);
-    
-    // Return proper WOPI response headers
-    res.setHeader('X-WOPI-ItemVersion', updatedFile.version);
-    res.setHeader('X-WOPI-Lock', locks.get(fileId) || '');
-    
-    res.status(200).send();
-    
-  } catch (error) {
-    console.error('❌ PutFile save error for:', fileId, error);
-    res.status(500).json({ error: 'Save failed' });
   }
+
+  const body = req.rawBody;
+  if (!body || !Buffer.isBuffer(body) || body.length === 0) {
+    if (DEBUG) console.log(`❌ [PutFile Error] No content provided`);
+    return res.status(400).json({ error: 'No file content' });
+  }
+
+  if (DEBUG) console.log(`📦 [PutFile Content] ${body.length} bytes received`);
+
+  const newVersion = writeFile(fileId, body);
+  
+  // Update lock if this is a new/extended lock
+  if (incomingLock && !locksMatch(incomingLock, currentLock)) {
+    locks.set(fileId, incomingLock);
+    if (DEBUG) console.log(`🔒 [PutFile Lock Updated] ${incomingLock}`);
+  }
+
+  if (DEBUG) console.log(`✅ [PutFile Success] Saved ${body.length} bytes, version: ${newVersion}`);
+
+  return ok(res, {
+    'X-WOPI-ItemVersion': newVersion,
+    'X-WOPI-Lock': locks.get(fileId) || ''
+  });
 });
 
-// Lock operations - UPDATED to handle any file
-app.post('/wopi/files/:fileId/lock', (req, res) => {
-  const { fileId } = req.params;
-  const accessToken = req.query.access_token;
-  const lockId = req.headers['x-wopi-lock'];
-  
-  console.log('🔒 Lock file:', fileId, 'Lock:', lockId);
-  
-  if (!accessToken || !validateAccessToken(accessToken, fileId)) {
-    return res.status(401).json({ error: 'Invalid token' });
-  }
-
-  // File doesn't need to exist for locking - it might be created soon
-  const currentLock = locks.get(fileId);
-  
-  if (!currentLock) {
-    locks.set(fileId, lockId);
-    console.log('✅ Lock acquired for:', fileId);
-    res.status(200).send();
-  } else if (currentLock === lockId) {
-    console.log('✅ Lock refreshed for:', fileId);
-    res.status(200).send();
-  } else {
-    console.log('❌ File already locked:', fileId, 'with:', currentLock);
-    res.setHeader('X-WOPI-Lock', currentLock);
-    res.status(409).send();
-  }
-});
-
-app.get('/wopi/files/:fileId/lock', (req, res) => {
-  const { fileId } = req.params;
-  const accessToken = req.query.access_token;
-  
-  console.log('🔍 Get lock for:', fileId);
-  
-  if (!accessToken || !validateAccessToken(accessToken, fileId)) {
-    return res.status(401).json({ error: 'Invalid token' });
-  }
-
-  const lock = locks.get(fileId);
-  if (lock) {
-    res.setHeader('X-WOPI-Lock', lock);
-    console.log('✅ Current lock for', fileId, ':', lock);
-  }
-  
-  res.status(200).send();
-});
-
-app.unlock('/wopi/files/:fileId/lock', (req, res) => {
-  const { fileId } = req.params;
-  const accessToken = req.query.access_token;
-  const lockId = req.headers['x-wopi-lock'];
-  
-  console.log('🔓 Unlock file:', fileId, 'Lock:', lockId);
-  
-  if (!accessToken || !validateAccessToken(accessToken, fileId)) {
-    return res.status(401).json({ error: 'Invalid token' });
-  }
-
-  const currentLock = locks.get(fileId);
-  
-  if (currentLock === lockId) {
-    locks.delete(fileId);
-    console.log('✅ Lock released for:', fileId);
-    res.status(200).send();
-  } else {
-    console.log('❌ Lock mismatch for:', fileId, 'Current:', currentLock, 'Requested:', lockId);
-    res.setHeader('X-WOPI-Lock', currentLock || '');
-    res.status(409).send();
-  }
-});
-
-// // PutRelativeFile - FIXED to generate proper access tokens for new files
+// LOCK / UNLOCK / REFRESH_LOCK / GET_LOCK - FIXED LOCK HANDLING
 app.post('/wopi/files/:fileId', (req, res) => {
   const { fileId } = req.params;
-  const accessToken = req.query.access_token;
-  const suggestedTarget = req.headers['x-wopi-suggestedtarget'];
+  const token = req.query.access_token;
   
-  console.log('📝 PutRelativeFile for:', fileId, 'Suggested:', suggestedTarget);
-  
-  if (!accessToken || !validateAccessToken(accessToken, fileId)) {
-    return res.status(401).json({ error: 'Invalid token' });
-  }
+  if (!validateToken(token, fileId)) return res.status(401).json({ error: 'Invalid token' });
 
-  try {
-    if (!req.rawBody) {
-      return res.status(400).json({ error: 'No file content provided' });
+  const override = (req.headers['x-wopi-override'] || '').toString().toUpperCase();
+  const incomingLock = getLockHeader(req);
+  const currentLock = locks.get(fileId) || null;
+
+  if (DEBUG) console.log(`🛠️ [Override: ${override}] ${fileId} - lock: ${incomingLock}`);
+
+  switch (override) {
+    case 'LOCK': {
+      if (!incomingLock) {
+        if (DEBUG) console.log(`❌ [LOCK Error] No lock provided`);
+        return res.status(400).send();
+      }
+      
+      // FIXED: Use intelligent lock comparison
+      const locksMatchResult = locksMatch(incomingLock, currentLock);
+      if (DEBUG) console.log(`🔍 [LOCK Comparison] current: ${currentLock}, incoming: ${incomingLock}, match: ${locksMatchResult}`);
+      
+      if (!currentLock || locksMatchResult) {
+        // Always update the lock to the latest version (Office extends locks with more metadata)
+        locks.set(fileId, incomingLock);
+        if (DEBUG) console.log(`🔒 [LOCK Acquired/Extended] ${incomingLock}`);
+        return ok(res);
+      }
+      
+      if (DEBUG) console.log(`❌ [LOCK Conflict] Already locked by: ${currentLock}`);
+      return conflict(res, currentLock, 'Already locked by a different lock');
     }
 
-    const newFileId = suggestedTarget || `document-${Date.now()}.docx`;
-    const sha256 = crypto.createHash('sha256').update(req.rawBody).digest('base64');
-    
-    // Create the new file
-    files.set(newFileId, {
-      name: newFileId,
-      size: req.rawBody.length,
-      lastModified: new Date().toISOString(),
-      version: Date.now().toString(),
-      sha256: sha256,
-      contents: req.rawBody
-    });
+    case 'UNLOCK': {
+      if (!incomingLock) {
+        if (DEBUG) console.log(`❌ [UNLOCK Error] No lock provided`);
+        return res.status(400).send();
+      }
+      
+      // FIXED: Use intelligent lock comparison
+      if (!currentLock || locksMatch(incomingLock, currentLock)) {
+        locks.delete(fileId);
+        if (DEBUG) console.log(`🔓 [UNLOCK Success] Lock removed`);
+        return ok(res);
+      }
+      
+      if (DEBUG) console.log(`❌ [UNLOCK Conflict] Wrong lock: ${incomingLock}, expected: ${currentLock}`);
+      return conflict(res, currentLock, 'Unlock with wrong lock');
+    }
 
-    console.log(`✅ New file created: ${newFileId} (${req.rawBody.length} bytes)`);
-    
-    // Generate access token for the new file
-    const newFileAccessToken = generateAccessToken(newFileId);
-    const newFileWopiSrc = `https://c67feb255965.ngrok-free.app/wopi/files/${newFileId}`;
-    
-    res.json({
-      Name: newFileId,
-      Url: newFileWopiSrc
-    });
-    
-  } catch (error) {
-    console.error('❌ PutRelativeFile error:', error);
-    res.status(500).json({ error: 'Create file failed' });
+    case 'REFRESH_LOCK': {
+      if (!incomingLock) {
+        if (DEBUG) console.log(`❌ [REFRESH_LOCK Error] No lock provided`);
+        return res.status(400).send();
+      }
+      
+      // FIXED: Use intelligent lock comparison
+      if (locksMatch(incomingLock, currentLock)) {
+        // Update to the latest lock version
+        locks.set(fileId, incomingLock);
+        if (DEBUG) console.log(`🔄 [REFRESH_LOCK Success] Lock refreshed and updated`);
+        return ok(res);
+      }
+      
+      if (DEBUG) console.log(`❌ [REFRESH_LOCK Conflict] Wrong lock: ${incomingLock}, expected: ${currentLock}`);
+      return conflict(res, currentLock, 'Refresh with wrong lock');
+    }
+
+    case 'GET_LOCK': {
+      if (DEBUG) console.log(`🔍 [GET_LOCK] Current lock: ${currentLock || 'NONE'}`);
+      if (currentLock) res.setHeader('X-WOPI-Lock', currentLock);
+      return res.status(200).send();
+    }
+
+    case 'PUT_RELATIVE': {
+      if (DEBUG) console.log(`❌ [PUT_RELATIVE] Disabled for now`);
+      return res.status(501).json({ error: 'PutRelative not supported' });
+    }
+
+    default:
+      if (DEBUG) console.log(`❌ [UNKNOWN Override] ${override}`);
+      return res.status(400).json({ error: 'Unsupported X-WOPI-Override' });
   }
 });
 
-// PutRelativeFile - DISABLED to prevent new file creation
-// app.post('/wopi/files/:fileId', (req, res) => {
-//   console.log('❌ PutRelativeFile called - returning error to force save to sample.docx');
-//   res.status(501).json({ error: 'Save As not supported - use Save to update original file' });
-// });
-
-// NEW: Endpoint to list all files (for debugging)
-app.get('/api/files', (req, res) => {
-  const fileList = Array.from(files.entries()).map(([fileId, file]) => ({
-    fileId,
-    name: file.name,
-    size: file.size,
-    version: file.version,
-    lastModified: file.lastModified
-  }));
-  
-  res.json({
-    files: fileList,
-    total: fileList.length
-  });
-});
-
-// Debug endpoint to check file status
-app.get('/api/debug-file/:fileId', (req, res) => {
-  const { fileId } = req.params;
-  const file = files.get(fileId);
-  
-  if (!file) {
-    return res.status(404).json({ error: 'File not found' });
-  }
-  
-  res.json({
-    fileId,
-    exists: true,
-    size: file.size,
-    version: file.version,
-    lastModified: file.lastModified,
-    sha256: file.sha256.substring(0, 16) + '...',
-    hasLock: !!locks.get(fileId)
-  });
-});
-
-// API endpoints
-app.get('/api/health', (req, res) => {
-  res.json({ 
-    status: 'OK', 
-    files: Array.from(files.keys()),
-    locks: Array.from(locks.entries()),
-    timestamp: new Date().toISOString()
-  });
-});
-
+// ---------- Convenience APIs ----------
 app.get('/api/generate-wopi-url', (req, res) => {
   const fileId = 'sample.docx';
-  
-  if (!files.has(fileId)) {
-    return res.status(404).json({ error: 'File not found' });
-  }
+  if (!readFileOrNull(fileId)) return res.status(404).json({ error: 'File not found' });
 
-  const accessToken = generateAccessToken(fileId);
-  const wopiSrc = `https://c67feb255965.ngrok-free.app/wopi/files/${fileId}`;
+  const token = generateToken(fileId);
+  const wopiSrc = `${PUBLIC_BASE}/wopi/files/${encodeURIComponent(fileId)}`;
+  const editUrl = `https://word-edit.officeapps.live.com/we/wordeditorframe.aspx?WOPISrc=${encodeURIComponent(wopiSrc)}&access_token=${encodeURIComponent(token)}&ui=en-US&rs=en-US`;
+
+  if (DEBUG) console.log(`🔗 [Generate URL] ${fileId}`);
   
-  const editUrl = `https://word-edit.officeapps.live.com/we/wordeditorframe.aspx?WOPISrc=${encodeURIComponent(wopiSrc)}&access_token=${accessToken}&ui=en-US&rs=en-US`;
-  
+  res.json({ fileId, wopiSrc, accessToken: token, editUrl });
+});
+
+app.get('/api/files', (req, res) => {
+  const all = fs.readdirSync(FILES_DIR).map(f => {
+    const st = fs.statSync(path.join(FILES_DIR, f));
+    return {
+      fileId: f,
+      size: st.size,
+      version: versions.get(f) || st.mtimeMs.toString(),
+      lastModified: new Date(st.mtime).toISOString()
+    };
+  });
+  res.json({ files: all, total: all.length });
+});
+
+app.get('/api/debug-file/:fileId', (req, res) => {
+  const { fileId } = req.params;
+  const p = filePathOf(fileId);
+  if (!fs.existsSync(p)) return res.status(404).json({ error: 'File not found' });
+  const buf = fs.readFileSync(p);
+  const st = fs.statSync(p);
   res.json({
-    wopiSrc,
-    accessToken,
     fileId,
-    editUrl
+    size: buf.length,
+    version: versions.get(fileId) || st.mtimeMs.toString(),
+    lastModified: new Date(st.mtime).toISOString(),
+    sha256: computeSha256(buf).slice(0, 16) + '...',
+    locked: !!locks.get(fileId),
+    lockValue: locks.get(fileId) || null
   });
 });
 
-app.get('/', (req, res) => {
-  res.json({ 
-    message: 'WOPI Server Running - COMPLETE FILE MANAGEMENT',
+// Clear locks endpoint
+app.post('/api/clear-locks', (req, res) => {
+  const count = locks.size;
+  locks.clear();
+  if (DEBUG) console.log(`🧹 [Clear Locks] Cleared ${count} locks`);
+  res.json({ message: `Cleared ${count} locks` });
+});
+
+// Reset sample file
+app.post('/api/reset-sample', (req, res) => {
+  const fileId = 'sample.docx';
+  const minimal = Buffer.from('UEsDBBQAAAAIAJySrVHHW+cgBAAAAAQAAAAIAAAAbWltZXR5cGVhcHBsaWNhdGlvbi92bmQub3BlbnhtbGZvrm1hdHMtb2ZmaWNlZG9jdW1lbnQud29yZHByb2Nlc3NpbmdtbC5kb2N1bWVudFBLBQYAAAAAAQABAD4AAAA0AAAAAAA=', 'base64');
+  writeFile(fileId, minimal);
+  locks.delete(fileId);
+  if (DEBUG) console.log(`🔄 [Reset Sample] Reset sample.docx`);
+  res.json({ message: 'Sample file reset' });
+});
+
+app.get('/', (_req, res) => {
+  res.json({
+    message: 'WOPI Server Running (Fixed Lock Comparison)',
+    base: PUBLIC_BASE,
     endpoints: {
-      health: '/api/health',
+      health: '/api/files',
       wopiUrl: '/api/generate-wopi-url',
-      files: '/api/files',
-      debugFile: '/api/debug-file/:fileId'
+      clearLocks: '/api/clear-locks (POST)',
+      resetSample: '/api/reset-sample (POST)',
+      debugFile: '/api/debug-file/sample.docx'
     }
   });
 });
 
 app.listen(PORT, () => {
-  console.log(`\n🚀 WOPI Server: http://localhost:${PORT}`);
-  console.log(`🌐 Ngrok: https://c67feb255965.ngrok-free.app`);
-  console.log(`\n✨ COMPLETE FILE MANAGEMENT - All files supported`);
-  console.log(`📁 Initial files:`, Array.from(files.keys()));
-  console.log(`\n💡 Visit /api/files to see all created files`);
+  console.log(`🚀 WOPI Server (Fixed Lock Comparison) listening on http://localhost:${PORT}`);
+  console.log(`📊 Debug logging: ${DEBUG}`);
+  console.log(`📁 Files directory: ${FILES_DIR}`);
 });
